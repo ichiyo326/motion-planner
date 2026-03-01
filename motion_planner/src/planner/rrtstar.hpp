@@ -1,6 +1,7 @@
 #pragma once
 #include <vector>
 #include <Eigen/Core>
+#include <random>
 #include "collision/collision_checker.hpp"
 #include "io/scene_loader.hpp"
 

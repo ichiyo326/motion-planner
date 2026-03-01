@@ -172,7 +172,7 @@ inline DistResult distRobotCapsuleVsBox(
 
     const int N = 8;
     double best_sd = 1e9;
-    Vec3   best_p_a, best_p_b, best_n;
+    Vec3   best_p_a = Vec3::Zero(), best_p_b = Vec3::Zero(), best_n = Vec3(0,0,1);
 
     for (int i = 0; i <= N; ++i) {
         double t = static_cast<double>(i) / N;

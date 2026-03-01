@@ -1,295 +1,241 @@
 #!/usr/bin/env python3
-"""
-render.py — Visualise a planned trajectory as an animated GIF.
-
-Usage:
-    python tools/render.py --csv out/trajectory.csv \
-                           --scene scene.json \
-                           --output out/plan.gif \
-                           --fps 15
-"""
-
-import argparse
-import json
-import math
-import os
-import sys
+import argparse, json, math
 from pathlib import Path
-
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
-from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
-from mpl_toolkits.mplot3d.art3d import Line3DCollection
-import matplotlib.animation as animation
+from mpl_toolkits.mplot3d import Axes3D
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
-# ─── DH parameters (must match fk.cpp) ──────────────────────────────────────
-DH = [
-    (0.000,  0.333,  0.0       ),
-    (0.000,  0.000, -math.pi/2 ),
-    (0.000,  0.316,  math.pi/2 ),
-    (0.0825, 0.000,  math.pi/2 ),
-    (-0.0825,0.384, -math.pi/2 ),
-    (0.000,  0.000,  math.pi/2 ),
-    (0.088,  0.000,  math.pi/2 ),
-]
+DH=[(0.000,0.333,0.0),(0.000,0.000,-math.pi/2),(0.000,0.316,math.pi/2),
+    (0.0825,0.000,math.pi/2),(-0.0825,0.384,-math.pi/2),(0.000,0.000,math.pi/2),(0.088,0.000,math.pi/2)]
 
-def dh_transform(a, d, alpha, theta):
-    ca, sa = math.cos(alpha), math.sin(alpha)
-    ct, st = math.cos(theta), math.sin(theta)
-    R = np.array([
-        [ct, -st*ca,  st*sa],
-        [st,  ct*ca, -ct*sa],
-        [0,   sa,     ca   ],
-    ])
-    t = np.array([a*ct, a*st, d])
-    return R, t
+def dh(a,d,alpha,theta):
+    ca,sa,ct,st=math.cos(alpha),math.sin(alpha),math.cos(theta),math.sin(theta)
+    return np.array([[ct,-st*ca,st*sa],[st,ct*ca,-ct*sa],[0,sa,ca]]),np.array([a*ct,a*st,d])
 
 def compute_fk(q):
-    """Return 8 joint positions (world frame)."""
-    positions = [np.zeros(3)]
-    orientations = [np.eye(3)]
-    for i, (a, d, alpha) in enumerate(DH):
-        R_local, t_local = dh_transform(a, d, alpha, q[i])
-        R_world = orientations[-1] @ R_local
-        p_world = positions[-1] + orientations[-1] @ t_local
-        orientations.append(R_world)
-        positions.append(p_world)
-    return positions  # list of 8 np.array(3)
+    pos=[np.zeros(3)];ori=[np.eye(3)]
+    for i,(a,d,alpha) in enumerate(DH):
+        R,t=dh(a,d,alpha,q[i]);pos.append(pos[-1]+ori[-1]@t);ori.append(ori[-1]@R)
+    return pos,ori
 
-# ─── Geometry helpers ────────────────────────────────────────────────────────
+def make_perp(n):
+    v=np.array([1,0,0]) if abs(n[0])<0.9 else np.array([0,1,0])
+    p=np.cross(n,v);p/=np.linalg.norm(p);return p,np.cross(n,p)
 
-def draw_capsule(ax, p, q, r, color, alpha=0.6):
-    """Draw a capsule as a cylinder + two sphere endpoints."""
-    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
-    axis = q - p
-    length = np.linalg.norm(axis)
-    if length < 1e-6:
-        u = np.array([r, 0, 0])
-        ax.scatter(*p, s=50, c=[color], alpha=alpha)
-        return
+def closest_on_seg(P,Q,x):
+    seg=Q-P;l2=np.dot(seg,seg)+1e-12
+    t=np.clip(np.dot(x-P,seg)/l2,0,1)
+    return P+t*seg
 
-    axis_n = axis / length
-    # Find a perpendicular
-    perp = np.array([1, 0, 0]) if abs(axis_n[0]) < 0.9 else np.array([0, 1, 0])
-    perp = np.cross(axis_n, perp)
-    perp /= np.linalg.norm(perp)
-    perp2 = np.cross(axis_n, perp)
+def compute_contacts(fkp,lcs,obs):
+    """全リンク×全障害物の最近点ペアを返す。最悪ペアも返す。"""
+    contacts=[]
+    for lc in lcs:
+        P=np.array(fkp[lc['joint_i']]);Q=np.array(fkp[lc['joint_j']]);r=lc['radius']
+        for o in obs:
+            c=np.array(o['pos'])
+            p_rob=closest_on_seg(P,Q,c)
+            if o['type']=='sphere':
+                d=np.linalg.norm(p_rob-c);robs=o['radius']
+                n=(p_rob-c)/(d+1e-12);p_obs=c+robs*n;p_rob2=p_rob-r*n
+                sd=d-r-robs
+            elif o['type']=='capsule':
+                w,x,y,z=o.get('quat',[1,0,0,0])
+                R=np.array([[1-2*(y*y+z*z),2*(x*y-z*w),2*(x*z+y*w)],
+                            [2*(x*y+z*w),1-2*(x*x+z*z),2*(y*z-x*w)],
+                            [2*(x*z-y*w),2*(y*z+x*w),1-2*(x*x+y*y)]])
+                ax_=R@np.array([0,0,1]);hl=o['half_length']
+                p_obs_ax=closest_on_seg(c-hl*ax_,c+hl*ax_,p_rob)
+                d=np.linalg.norm(p_rob-p_obs_ax);robs=o['radius']
+                n=(p_rob-p_obs_ax)/(d+1e-12);p_obs=p_obs_ax+robs*n;p_rob2=p_rob-r*n
+                sd=d-r-robs
+            elif o['type']=='box':
+                w,x,y,z=o.get('quat',[1,0,0,0])
+                R=np.array([[1-2*(y*y+z*z),2*(x*y-z*w),2*(x*z+y*w)],
+                            [2*(x*y+z*w),1-2*(x*x+z*z),2*(y*z-x*w)],
+                            [2*(x*z-y*w),2*(y*z+x*w),1-2*(x*x+y*y)]])
+                he=np.array(o['half_extents']);d_=p_rob-np.array(o['pos'])
+                local=R.T@d_;clamped=np.clip(local,-he,he);p_obs=np.array(o['pos'])+R@clamped
+                d=np.linalg.norm(p_rob-p_obs);n=(p_rob-p_obs)/(d+1e-12)
+                p_rob2=p_rob-r*n;sd=d-r
+            else:
+                continue
+            contacts.append(dict(sd=sd,p_obs=p_obs,p_rob=p_rob2,n=n))
+    contacts.sort(key=lambda c:c['sd'])
+    return contacts
 
-    N = 12
-    theta = np.linspace(0, 2*math.pi, N, endpoint=False)
-    ring = np.array([math.cos(t)*perp + math.sin(t)*perp2 for t in theta])
+def draw_capsule(ax,p,q,r,col,alpha=0.90,N=16):
+    axis=q-p;L=np.linalg.norm(axis)
+    if L<1e-6:return
+    n=axis/L;u,v=make_perp(n)
+    th=np.linspace(0,2*math.pi,N,endpoint=False)
+    ring=np.array([math.cos(t)*u+math.sin(t)*v for t in th])
+    sides=[[p+r*ring[i],p+r*ring[(i+1)%N],q+r*ring[(i+1)%N],q+r*ring[i]] for i in range(N)]
+    pc=Poly3DCollection(sides,alpha=alpha,linewidth=0);pc.set_facecolor(col);pc.set_edgecolor('none');ax.add_collection3d(pc)
+    for c in [p,q]:
+        cc=Poly3DCollection([[c+r*ring[i],c+r*ring[(i+1)%N],c] for i in range(N)],alpha=alpha,linewidth=0)
+        cc.set_facecolor(col);cc.set_edgecolor('none');ax.add_collection3d(cc)
 
-    # Cylinder faces
-    for i in range(N):
-        j = (i+1) % N
-        verts = [
-            p + r*ring[i], p + r*ring[j],
-            q + r*ring[j], q + r*ring[i],
-        ]
-        poly = Poly3DCollection([verts], alpha=alpha)
-        poly.set_facecolor(color)
-        poly.set_edgecolor('none')
-        ax.add_collection3d(poly)
+def draw_sphere(ax,pos,r,col,a=0.50):
+    u=np.linspace(0,2*math.pi,24);v=np.linspace(0,math.pi,14)
+    ax.plot_surface(pos[0]+r*np.outer(np.cos(u),np.sin(v)),
+                    pos[1]+r*np.outer(np.sin(u),np.sin(v)),
+                    pos[2]+r*np.outer(np.ones_like(u),np.cos(v)),
+                    color=col,alpha=a,linewidth=0)
 
-    # Caps (simple circle patches approximation)
-    for centre in [p, q]:
-        cap_verts = [centre + r*ring[i] for i in range(N)]
-        cap_poly = Poly3DCollection([cap_verts], alpha=alpha)
-        cap_poly.set_facecolor(color)
-        cap_poly.set_edgecolor('none')
-        ax.add_collection3d(cap_poly)
+def draw_box(ax,pos,qw,he,col):
+    w,x,y,z=qw
+    R=np.array([[1-2*(y*y+z*z),2*(x*y-z*w),2*(x*z+y*w)],
+                [2*(x*y+z*w),1-2*(x*x+z*z),2*(y*z-x*w)],
+                [2*(x*z-y*w),2*(y*z+x*w),1-2*(x*x+y*y)]])
+    C=np.array([(R@(np.array(s)*np.array(he)))+pos
+                for s in [[-1,-1,-1],[1,-1,-1],[1,1,-1],[-1,1,-1],
+                           [-1,-1,1],[1,-1,1],[1,1,1],[-1,1,1]]])
+    faces=[[C[0],C[1],C[2],C[3]],[C[4],C[5],C[6],C[7]],
+           [C[0],C[1],C[5],C[4]],[C[2],C[3],C[7],C[6]],
+           [C[1],C[2],C[6],C[5]],[C[0],C[3],C[7],C[4]]]
+    fc=Poly3DCollection(faces,alpha=0.15,linewidth=0);fc.set_facecolor(col);fc.set_edgecolor('none');ax.add_collection3d(fc)
+    for a,b in [(0,1),(1,2),(2,3),(3,0),(4,5),(5,6),(6,7),(7,4),(0,4),(1,5),(2,6),(3,7)]:
+        ax.plot3D(*zip(C[a],C[b]),color=col,alpha=1.0,lw=2.5)
 
-def draw_sphere(ax, centre, radius, color, alpha=0.5):
-    u = np.linspace(0, 2*math.pi, 16)
-    v = np.linspace(0, math.pi, 10)
-    x = centre[0] + radius * np.outer(np.cos(u), np.sin(v))
-    y = centre[1] + radius * np.outer(np.sin(u), np.sin(v))
-    z = centre[2] + radius * np.outer(np.ones_like(u), np.cos(v))
-    ax.plot_surface(x, y, z, color=color, alpha=alpha, linewidth=0)
+def draw_obs_capsule(ax,pos,qw,r,hl,col):
+    w,x,y,z=qw
+    R=np.array([[1-2*(y*y+z*z),2*(x*y-z*w),2*(x*z+y*w)],
+                [2*(x*y+z*w),1-2*(x*x+z*z),2*(y*z-x*w)],
+                [2*(x*z-y*w),2*(y*z+x*w),1-2*(x*x+y*y)]])
+    ax_=R@np.array([0,0,1])
+    draw_capsule(ax,np.array(pos)-hl*ax_,np.array(pos)+hl*ax_,r,col,0.50)
 
-def draw_box(ax, pos, quat_wxyz, half_extents, color, alpha=0.4):
-    """Draw an OBB as a wireframe box."""
-    w, x, y, z = quat_wxyz
-    # Rotation matrix from quaternion (wxyz active)
-    R = np.array([
-        [1-2*(y*y+z*z),   2*(x*y-z*w),   2*(x*z+y*w)],
-        [  2*(x*y+z*w), 1-2*(x*x+z*z),   2*(y*z-x*w)],
-        [  2*(x*z-y*w),   2*(y*z+x*w), 1-2*(x*x+y*y)],
-    ])
-    h = half_extents
-    corners_local = np.array([
-        [-h[0], -h[1], -h[2]], [ h[0], -h[1], -h[2]],
-        [ h[0],  h[1], -h[2]], [-h[0],  h[1], -h[2]],
-        [-h[0], -h[1],  h[2]], [ h[0], -h[1],  h[2]],
-        [ h[0],  h[1],  h[2]], [-h[0],  h[1],  h[2]],
-    ])
-    corners = (R @ corners_local.T).T + np.array(pos)
-    edges = [(0,1),(1,2),(2,3),(3,0),(4,5),(5,6),(6,7),(7,4),
-             (0,4),(1,5),(2,6),(3,7)]
-    for a, b in edges:
-        ax.plot3D(*zip(corners[a], corners[b]), color=color, alpha=0.8, lw=1.5)
-
-def draw_capsule_obstacle(ax, pos, quat_wxyz, radius, half_length, color, alpha=0.5):
-    w, x, y, z = quat_wxyz
-    R = np.array([
-        [1-2*(y*y+z*z),   2*(x*y-z*w),   2*(x*z+y*w)],
-        [  2*(x*y+z*w), 1-2*(x*x+z*z),   2*(y*z-x*w)],
-        [  2*(x*z-y*w),   2*(y*z+x*w), 1-2*(x*x+y*y)],
-    ])
-    axis = R @ np.array([0, 0, 1])
-    p = np.array(pos) - half_length * axis
-    q = np.array(pos) + half_length * axis
-    draw_capsule(ax, p, q, radius, color, alpha)
-
-# ─── Colour from min_sd ──────────────────────────────────────────────────────
-
-def sd_color(sd, d_safe):
-    if sd < 0:       return 'red'
-    if sd < d_safe:  return 'orange'
-    return 'limegreen'
-
-# ─── Main ────────────────────────────────────────────────────────────────────
+def sd_color(sd,ds):
+    return '#e74c3c' if sd<0 else ('#f39c12' if sd<ds else '#2ecc71')
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--csv',    required=True)
-    parser.add_argument('--scene',  required=True)
-    parser.add_argument('--output', default='out/plan.gif')
-    parser.add_argument('--fps',    type=int, default=10)
-    parser.add_argument('--dpi',    type=int, default=90)
-    args = parser.parse_args()
+    pa=argparse.ArgumentParser()
+    pa.add_argument('--csv',required=True);pa.add_argument('--scene',required=True)
+    pa.add_argument('--output',default='out/plan.gif');pa.add_argument('--fps',type=int,default=6)
+    pa.add_argument('--dpi',type=int,default=140);pa.add_argument('--elev',type=float,default=28)
+    pa.add_argument('--azim',type=float,default=-50)
+    args=pa.parse_args()
 
-    # Load
-    waypoints = np.loadtxt(args.csv, delimiter=',', skiprows=1)
-    if waypoints.ndim == 1:
-        waypoints = waypoints[np.newaxis, :]
+    wps=np.loadtxt(args.csv,delimiter=',',skiprows=1)
+    if wps.ndim==1:wps=wps[np.newaxis,:]
+    with open(args.scene) as f:sc=json.load(f)
+    obs=sc.get('obstacles',[]);lcs=sc['robot']['link_capsules'];ds=sc['planning']['d_safe']
 
-    with open(args.scene) as f:
-        scene = json.load(f)
+    all_fk=[compute_fk(q) for q in wps]
+    all_contacts=[compute_contacts(f[0],lcs,obs) for f in all_fk]
+    all_sd=[c[0]['sd'] if c else 1e9 for c in all_contacts]
+    ee=np.array([f[0][-1] for f in all_fk])
 
-    obstacles = scene.get('obstacles', [])
-    link_caps = scene['robot']['link_capsules']
-    d_safe    = scene['planning']['d_safe']
+    fd=Path(args.output).parent/'frames';fd.mkdir(parents=True,exist_ok=True)
+    print(f"[render] {len(wps)} frames | fps={args.fps} | dpi={args.dpi}")
 
-    # Compute FK for all waypoints
-    all_fk = [compute_fk(q) for q in waypoints]
+    frame_paths=[]
+    for fi,((fkp,_),contacts,s) in enumerate(zip(all_fk,all_contacts,all_sd)):
+        fig=plt.figure(figsize=(11,8),facecolor='#0d0d1f')
+        ax=fig.add_subplot(111,projection='3d');ax.set_facecolor('#0d0d1f')
+        ax.view_init(elev=args.elev,azim=args.azim)
+        ax.set_xlim(-0.2,0.9);ax.set_ylim(-0.7,0.7);ax.set_zlim(0.0,1.3)
+        for sp in [ax.xaxis.pane,ax.yaxis.pane,ax.zaxis.pane]:
+            sp.fill=False;sp.set_edgecolor('#2a2a4a')
+        ax.tick_params(colors='#8888aa',labelsize=8)
+        ax.set_xlabel('X (m)',color='#8888aa',labelpad=6)
+        ax.set_ylabel('Y (m)',color='#8888aa',labelpad=6)
+        ax.set_zlabel('Z (m)',color='#8888aa',labelpad=6)
 
-    # Compute min_sd (approximate — just use min joint-to-obstacle)
-    # For rendering purposes we use a simplified sd estimate
-    def approx_min_sd(fk_positions, caps, obs_list):
-        min_sd = 1e9
-        for lc in caps:
-            P = np.array(fk_positions[lc['joint_i']])
-            Q = np.array(fk_positions[lc['joint_j']])
-            r = lc['radius']
-            for obs in obs_list:
-                if obs['type'] == 'sphere':
-                    c = np.array(obs['pos'])
-                    # dist from sphere centre to segment
-                    seg = Q - P
-                    t = np.clip(np.dot(c - P, seg) / (np.dot(seg,seg)+1e-12), 0, 1)
-                    closest = P + t*seg
-                    dist = np.linalg.norm(c - closest)
-                    sd = dist - r - obs['radius']
-                    if sd < min_sd: min_sd = sd
-        return min_sd
+        # EE trail
+        past=ee[:fi+1]
+        if len(past)>1:
+            for k in range(len(past)-1):
+                a_t=0.15+0.75*(k/max(len(past)-1,1))
+                ax.plot([past[k,0],past[k+1,0]],[past[k,1],past[k+1,1]],
+                        [past[k,2],past[k+1,2]],'-',color='#a29bfe',lw=2.0,alpha=a_t)
+        ax.scatter(*ee[fi],c='#fd79a8',s=120,zorder=15,depthshade=False,
+                   edgecolors='white',linewidths=1.2)
 
-    all_min_sd = [approx_min_sd(fk, link_caps, obstacles) for fk in all_fk]
+        # d_safe バッファ球（障害物ごと）
+        for o in obs:
+            if o['type']=='sphere':
+                draw_sphere(ax,o['pos'],o['radius']+ds,'#ffffff',0.05)
 
-    # Animation
-    fig = plt.figure(figsize=(8, 6))
-    ax = fig.add_subplot(111, projection='3d')
+        # 障害物
+        for o in obs:
+            t=o['type']
+            if t=='sphere':draw_sphere(ax,o['pos'],o['radius'],'#0984e3',0.55)
+            elif t=='box':draw_box(ax,o['pos'],o.get('quat',[1,0,0,0]),o['half_extents'],'#74b9ff')
+            elif t=='capsule':draw_obs_capsule(ax,o['pos'],o.get('quat',[1,0,0,0]),o['radius'],o['half_length'],'#0984e3')
 
-    def update(frame_idx):
-        ax.cla()
-        ax.set_xlim(-0.5, 1.0); ax.set_ylim(-0.8, 0.8); ax.set_zlim(0, 1.2)
-        ax.set_xlabel('X (m)'); ax.set_ylabel('Y (m)'); ax.set_zlabel('Z (m)')
+        # ロボット
+        rc=sd_color(s,ds)
+        for lc in lcs:
+            P=np.array(fkp[lc['joint_i']]);Q=np.array(fkp[lc['joint_j']])
+            draw_capsule(ax,P,Q,lc['radius'],rc,alpha=0.90)
+            ax.plot3D(*zip(P,Q),color='white',lw=2.0,alpha=1.0,zorder=6)
+        pts=np.array(fkp)
+        ax.scatter(pts[:,0],pts[:,1],pts[:,2],c='white',s=55,zorder=11,depthshade=False)
 
-        fk  = all_fk[frame_idx]
-        msd = all_min_sd[frame_idx]
+        # ★ 最近点ペアを線で描画（上位3ペア）
+        for i,ct in enumerate(contacts[:3]):
+            pr=ct['p_rob'];po=ct['p_obs'];sd_=ct['sd']
+            lc_=sd_color(sd_,ds)
+            lw_=3.0 if i==0 else 1.5
+            alpha_=1.0 if i==0 else 0.4
+            # 距離線
+            ax.plot3D(*zip(pr,po),color=lc_,lw=lw_,alpha=alpha_,
+                      linestyle='--',zorder=20)
+            # witness点
+            ax.scatter(*pr,c=lc_,s=60 if i==0 else 30,zorder=21,depthshade=False)
+            ax.scatter(*po,c=lc_,s=60 if i==0 else 30,zorder=21,
+                       marker='x',depthshade=False)
+            # 最近ペアにsd値をラベル
+            if i==0:
+                mid=(np.array(pr)+np.array(po))/2
+                ax.text(mid[0],mid[1],mid[2],f" {sd_:.3f}m",
+                        color=lc_,fontsize=9,fontweight='bold',zorder=22)
 
-        # ── Draw obstacles ───────────────────────────────────────────────
-        for obs in obstacles:
-            if obs['type'] == 'sphere':
-                draw_sphere(ax, obs['pos'], obs['radius'], color='steelblue')
-            elif obs['type'] == 'box':
-                draw_box(ax, obs['pos'], obs.get('quat',[1,0,0,0]),
-                         obs['half_extents'], color='slategray')
-            elif obs['type'] == 'capsule':
-                draw_capsule_obstacle(ax, obs['pos'], obs.get('quat',[1,0,0,0]),
-                                      obs['radius'], obs['half_length'],
-                                      color='steelblue')
+        # タイトル
+        st="⚠ COLLISION" if s<0 else("△ NEAR" if s<ds else "✓ SAFE")
+        rc2=sd_color(s,ds)
+        pct=(fi+1)/len(wps)*100
+        fig.text(0.5,0.97,
+                 f"Step {fi+1:02d}/{len(wps)}   │   min_sd={s:+.4f}m   │   {st}   │   {pct:.0f}%",
+                 ha='center',va='top',color='white',fontsize=13,fontweight='bold',
+                 bbox=dict(facecolor=rc2,alpha=0.25,edgecolor=rc2,boxstyle='round,pad=0.5'))
 
-        # ── Draw robot capsules ──────────────────────────────────────────
-        rob_color = sd_color(msd, d_safe)
-        for lc in link_caps:
-            P = np.array(fk[lc['joint_i']])
-            Q = np.array(fk[lc['joint_j']])
-            draw_capsule(ax, P, Q, lc['radius'], rob_color, alpha=0.75)
-            ax.plot3D(*zip(P, Q), color='black', lw=1.5, alpha=0.9)
+        # プログレスバー
+        bar=fig.add_axes([0.12,0.04,0.78,0.018])
+        bar.set_xlim(0,1);bar.set_ylim(0,1);bar.set_facecolor('#222244')
+        bar.set_xticks([]);bar.set_yticks([])
+        bar.barh(0.5,(fi+1)/len(wps),height=1.0,color=rc2,alpha=0.85)
+        bar.text(0.5,0.5,f"{pct:.0f}%",ha='center',va='center',
+                 color='white',fontsize=9,fontweight='bold')
 
-        # ── Joint dots ───────────────────────────────────────────────────
-        pts = np.array(fk)
-        ax.scatter(pts[:,0], pts[:,1], pts[:,2], c='k', s=20, zorder=5)
-
-        # ── Status text ──────────────────────────────────────────────────
-        status = ("COLLISION" if msd < 0
-                  else "NEAR" if msd < d_safe
-                  else "SAFE")
-        ax.set_title(
-            f"Frame {frame_idx+1}/{len(waypoints)} | "
-            f"min_sd={msd:.4f} m | {status}",
-            fontsize=10
-        )
-
-        # Legend
-        patches = [
-            mpatches.Patch(color='limegreen', label='safe (sd ≥ d_safe)'),
-            mpatches.Patch(color='orange',    label='near (0 ≤ sd < d_safe)'),
-            mpatches.Patch(color='red',       label='collision (sd < 0)'),
-            mpatches.Patch(color='steelblue', label='obstacle'),
+        patches=[
+            mpatches.Patch(color='#2ecc71',label=f'✓ SAFE  sd≥{ds}m'),
+            mpatches.Patch(color='#f39c12',label=f'△ NEAR  0≤sd<{ds}m'),
+            mpatches.Patch(color='#e74c3c',label='⚠ COLLISION  sd<0'),
+            mpatches.Patch(color='#0984e3',label='Obstacle'),
+            mpatches.Patch(color='#a29bfe',label='EE path'),
+            plt.Line2D([0],[0],color='#2ecc71',lw=2,ls='--',label='Closest distance'),
         ]
-        ax.legend(handles=patches, loc='upper right', fontsize=7)
+        ax.legend(handles=patches,loc='upper left',fontsize=8.5,
+                  framealpha=0.40,facecolor='#1a1a35',edgecolor='#444466',labelcolor='white')
 
-    out_dir = Path(args.output).parent
-    frames_dir = out_dir / 'frames'
-    frames_dir.mkdir(parents=True, exist_ok=True)
+        fig.subplots_adjust(top=0.93,bottom=0.08,left=0.02,right=0.98)
+        fp2=fd/f"frame_{fi:04d}.png"
+        fig.savefig(fp2,dpi=args.dpi,bbox_inches='tight',facecolor=fig.get_facecolor())
+        plt.close(fig);frame_paths.append(fp2)
+        if (fi+1)%10==0:print(f"  {fi+1}/{len(wps)}")
 
-    print(f"[render] Generating {len(waypoints)} frames...")
-    frame_paths = []
-    for i in range(len(waypoints)):
-        update(i)
-        fp = frames_dir / f"frame_{i:04d}.png"
-        fig.savefig(fp, dpi=args.dpi, bbox_inches='tight')
-        frame_paths.append(fp)
-        if (i+1) % 10 == 0:
-            print(f"  {i+1}/{len(waypoints)}")
+    from PIL import Image
+    imgs=[Image.open(f) for f in frame_paths]
+    ms=int(1000/args.fps);dur=[ms]*len(imgs)
+    dur[0]=ms*4;dur[-1]=ms*6
+    imgs[0].save(args.output,save_all=True,append_images=imgs[1:],loop=0,duration=dur,optimize=False)
+    print(f"[render] ✓ {args.output}  ({len(imgs)} frames, {args.fps} fps)")
 
-    plt.close(fig)
-
-    # Assemble GIF
-    try:
-        from PIL import Image
-        imgs = [Image.open(fp) for fp in frame_paths]
-        ms = int(1000 / args.fps)
-        imgs[0].save(args.output, save_all=True, append_images=imgs[1:],
-                     loop=0, duration=ms)
-        print(f"[render] GIF saved → {args.output}")
-    except ImportError:
-        print("[render] Pillow not found — trying ffmpeg fallback...")
-        import subprocess
-        pattern = str(frames_dir / 'frame_%04d.png')
-        subprocess.run([
-            'ffmpeg', '-y', '-framerate', str(args.fps),
-            '-i', pattern,
-            '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
-            args.output
-        ], check=True)
-        print(f"[render] GIF saved → {args.output}")
-
-
-if __name__ == '__main__':
-    main()
+if __name__=='__main__':main()
