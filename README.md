@@ -1,8 +1,6 @@
 # 7DoF Arm Motion Planner
 
 
-![Motion Planning Demo](docs/plan.gif)
-
 **Panda-like 7DoF × 3D Primitive Obstacles × RRT\* (+TrajOpt optional)**
 ![Motion Planning Demo](docs/plan.gif)
 
