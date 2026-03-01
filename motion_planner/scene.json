@@ -1,0 +1,83 @@
+{
+  "meta": {
+    "units": "m",
+    "angles": "rad",
+    "frame": "RH_Z_UP",
+    "quat": "wxyz"
+  },
+  "robot": {
+    "type": "panda_like_7dof",
+    "base": {
+      "pos": [0, 0, 0],
+      "quat": [1, 0, 0, 0]
+    },
+    "joint_limits": [
+      { "min": -2.8973, "max":  2.8973 },
+      { "min": -1.7628, "max":  1.7628 },
+      { "min": -2.8973, "max":  2.8973 },
+      { "min": -3.0718, "max": -0.0698 },
+      { "min": -2.8973, "max":  2.8973 },
+      { "min": -0.0175, "max":  3.7525 },
+      { "min": -2.8973, "max":  2.8973 }
+    ],
+    "link_capsules": [
+      { "joint_i": 0, "joint_j": 1, "radius": 0.04 },
+      { "joint_i": 1, "joint_j": 2, "radius": 0.04 },
+      { "joint_i": 2, "joint_j": 3, "radius": 0.04 },
+      { "joint_i": 3, "joint_j": 4, "radius": 0.035 },
+      { "joint_i": 4, "joint_j": 5, "radius": 0.035 },
+      { "joint_i": 5, "joint_j": 6, "radius": 0.030 },
+      { "joint_i": 6, "joint_j": 7, "radius": 0.025 }
+    ]
+  },
+  "start": { "q": [0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785] },
+  "goal":  { "q": [1.0, -0.500, 0.3, -1.800, 0.2, 1.200, 0.500],
+             "tolerance": { "l2": 0.05 } },
+  "obstacles": [
+    {
+      "id": "box1",
+      "type": "box",
+      "pos": [0.5, 0.0, 0.5],
+      "quat": [1, 0, 0, 0],
+      "half_extents": [0.10, 0.20, 0.15]
+    },
+    {
+      "id": "sphere1",
+      "type": "sphere",
+      "pos": [0.3, 0.4, 0.6],
+      "radius": 0.08
+    },
+    {
+      "id": "capsule1",
+      "type": "capsule",
+      "pos": [0.2, -0.3, 0.4],
+      "quat": [0.7071068, 0, 0.7071068, 0],
+      "radius": 0.05,
+      "half_length": 0.20
+    }
+  ],
+  "planning": {
+    "d_safe": 0.02,
+    "edge_check": {
+      "mode": "adaptive",
+      "max_step": 0.05,
+      "max_depth": 12
+    },
+    "rrtstar": {
+      "max_iter": 20000,
+      "eta": 0.3,
+      "goal_bias": 0.05,
+      "gamma": 2.0,
+      "informed": false,
+      "seed": 42
+    }
+  },
+  "trajopt": {
+    "enabled": true,
+    "num_waypoints": 40,
+    "dt": 0.1,
+    "weights": { "smooth": 1.0, "collision": 10.0 },
+    "penalty": { "mu0": 1.0, "mu_mult": 10.0, "outer_iters": 5 },
+    "trust_region": { "radius0": 0.2, "shrink": 0.5, "grow": 1.5 }
+  }
+}
